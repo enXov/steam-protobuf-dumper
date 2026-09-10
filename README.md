@@ -18,6 +18,10 @@ Pass `--debug` for verbose logging:
 steam-protobuf-dumper --debug steam_bins/steamclient.so steam_bins/steamui.so protos/
 ```
 
+## Releases
+
+If you don't want to build the project from source, you can download the latest pre-built binaries from the [**Releases**](https://github.com/enXov/steam-protobuf-dumper/releases/latest) page.
+
 ## Building
 
 ```bash
