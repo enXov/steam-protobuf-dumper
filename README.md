@@ -6,6 +6,14 @@ Extracts embedded [Protocol Buffer](https://protobuf.dev/) definitions from Stea
 
 Steam's native binaries (`steamclient.so`, `steamui.so`) embed serialized `FileDescriptorProto` blobs. This tool scans the raw bytes for protobuf markers, parses the descriptors, resolves cross-file dependencies, and reconstructs human-readable `.proto` source files.
 
+## Why does this exist?
+
+This project is not intended to be used on its own. It was originally created as a supporting tool for [steam-protobuf-rs](https://github.com/enXov/steam-protobuf-rs).
+
+You can still use it independently with your own projects or workflows. I separated it into its own project to keep everything organized and make the codebase easier to explore and learn from.
+
+For more information about the overall project and why it exists, see the [steam-protobuf-rs](https://github.com/enXov/steam-protobuf-rs#why-this-exists) README.
+
 ## Usage
 
 ```bash
