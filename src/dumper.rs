@@ -7,7 +7,7 @@ use protobuf::descriptor::{
 };
 use protobuf::Message;
 use protobuf::UnknownValueRef;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 
 // ─── Node types for the dependency graph ────────────────────────────────────
@@ -471,8 +471,8 @@ impl ProtobufDumper {
         level: usize,
         marker: &mut bool,
     ) {
-        // Group by extendee
-        let mut groups: HashMap<&str, Vec<&FieldDescriptorProto>> = HashMap::new();
+        // Group by extendee — BTreeMap ensures deterministic output order
+        let mut groups: BTreeMap<&str, Vec<&FieldDescriptorProto>> = BTreeMap::new();
         for field in fields {
             if field.extendee().is_empty() {
                 continue;
@@ -1029,8 +1029,17 @@ impl ProtobufDumper {
             None => return,
         };
 
-        // Find all extension fields that extend this options type
-        for (type_path, type_node) in &self.protobuf_type_map {
+        // Find all extension fields that extend this options type.
+        // Sort by field number for deterministic output order (HashMap iteration is random).
+        let mut sorted_types: Vec<_> = self.protobuf_type_map.iter().collect();
+        sorted_types.sort_by_key(|(_, node)| {
+            if let TypeSource::Field(ref field) = node.source {
+                field.number()
+            } else {
+                0
+            }
+        });
+        for (type_path, type_node) in sorted_types {
             let proto_name = match &type_node.proto_name {
                 Some(n) => n,
                 None => continue,
