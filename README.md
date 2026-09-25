@@ -8,11 +8,13 @@ Steam's native binaries (`steamclient.so`, `steamui.so`) embed serialized `FileD
 
 ## Why does this exist?
 
-This project is not intended to be used on its own. It was originally created as a supporting tool for [steam-protobuf-rs](https://github.com/enXov/steam-protobuf-rs).
+You might be wondering: why make a Rust version of this instead of just using the original tool?
 
-You can still use it independently with your own projects or workflows. I separated it into its own project to keep everything organized and make the codebase easier to explore and learn from.
+When I started this port, compiling the original tool to AOT wasn't really an option without modifying some of its dependencies and libraries. I also didn't want to have the C#/.NET runtime installed on my machine just to run a small utility like this (average Linux user LMAO).
 
-For more information about the overall project and why it exists, see the [steam-protobuf-rs](https://github.com/enXov/steam-protobuf-rs#why-this-exists) README.
+Instead of going through the trouble of making the original tool AOT-compatible, I decided to just port it to Rust. I generally prefer AOT-compiled software over JIT, and, for reasons I can't really explain, I don't particularly like C# either.
+
+So yeah, that's pretty much it.
 
 ## Usage
 
