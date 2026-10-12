@@ -1,13 +1,14 @@
+use crate::collector::read_varint;
 use crate::util;
 use protobuf::descriptor::field_descriptor_proto::{Label, Type};
 use protobuf::descriptor::{
-    DescriptorProto, EnumDescriptorProto, EnumOptions, EnumValueOptions, FieldDescriptorProto,
-    FieldOptions, FileDescriptorProto, FileOptions, MessageOptions, MethodOptions,
-    ServiceDescriptorProto, ServiceOptions,
+    DescriptorProto, EnumDescriptorProto, EnumOptions, EnumValueOptions, ExtensionRangeOptions,
+    FieldDescriptorProto, FieldOptions, FileDescriptorProto, FileOptions, MessageOptions,
+    MethodOptions, OneofOptions, ServiceDescriptorProto, ServiceOptions,
 };
-use protobuf::Message;
 use protobuf::UnknownValueRef;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
 // ─── Node types for the dependency graph ────────────────────────────────────
@@ -48,6 +49,10 @@ pub struct ProtobufDumper {
     protobufs: Vec<FileDescriptorProto>,
     protobuf_map: HashMap<String, ProtoNode>,
     protobuf_type_map: HashMap<String, ProtoTypeNode>,
+    /// Imports that must be added to the file currently being dumped because it
+    /// uses options that only the binary's descriptor.proto defines. Interior
+    /// mutability avoids threading state through every dump function.
+    option_imports: RefCell<BTreeSet<String>>,
 }
 
 impl ProtobufDumper {
@@ -56,6 +61,7 @@ impl ProtobufDumper {
             protobufs,
             protobuf_map: HashMap::new(),
             protobuf_type_map: HashMap::new(),
+            option_imports: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -316,6 +322,23 @@ impl ProtobufDumper {
         type_names.push(tn);
 
         for ext in &msg.extension {
+            // Extensions can be declared inside a message; register them under
+            // their full path so their options use the full name as the key
+            let etn = get_package_path(&get_package_path(package_path, msg.name()), ext.name());
+            Self::get_or_create_type_node(
+                type_map,
+                &etn,
+                Some(proto_name),
+                TypeSource::Field(ext.clone()),
+            );
+            type_names.push(etn);
+
+            if is_named_type(ext.type_()) && !ext.type_name().is_empty() {
+                let tn = get_package_path(package_path, ext.type_name());
+                Self::get_or_create_type_node(type_map, &tn, None, TypeSource::None);
+                type_names.push(tn);
+            }
+
             if !ext.extendee().is_empty() {
                 let etn = get_package_path(package_path, ext.extendee());
                 Self::get_or_create_type_node(type_map, &etn, None, TypeSource::None);
@@ -379,17 +402,29 @@ impl ProtobufDumper {
 
         if depth == 0 {
             for dep in &proto.dependency {
+                // Google dependencies are not required to be in the binary
+                if !self.is_dependency_defined(dep) {
+                    continue;
+                }
                 set.insert(dep.to_string());
                 self.recursive_add_public_dependencies(set, dep, depth + 1);
             }
         } else {
             for &idx in &proto.public_dependency {
-                if let Some(dep) = proto.dependency.get(idx as usize) {
-                    set.insert(dep.to_string());
-                    self.recursive_add_public_dependencies(set, dep, depth + 1);
+                let Some(dep) = proto.dependency.get(idx as usize) else {
+                    continue;
+                };
+                if !self.is_dependency_defined(dep) {
+                    continue;
                 }
+                set.insert(dep.to_string());
+                self.recursive_add_public_dependencies(set, dep, depth + 1);
             }
         }
+    }
+
+    fn is_dependency_defined(&self, name: &str) -> bool {
+        self.protobuf_map.get(name).is_some_and(|n| n.defined)
     }
 
     // ─── File generation ────────────────────────────────────────────────────
@@ -427,6 +462,10 @@ impl ProtobufDumper {
             marker = true;
         }
 
+        let imports_end = sb.len();
+        let has_heading = marker;
+        self.option_imports.borrow_mut().clear();
+
         // Package
         if !proto.package().is_empty() {
             append_heading_space(sb, &mut marker);
@@ -460,6 +499,23 @@ impl ProtobufDumper {
         // Services
         for service in &proto.service {
             self.dump_service(proto, service, sb, &mut marker);
+        }
+
+        // Valve's protoc has the options of its descriptor.proto built in, so the binary doesn't
+        // list the import, but any other protoc only knows them when the file imports it
+        let option_imports = self.option_imports.borrow();
+        if !option_imports.is_empty() {
+            let mut imports = String::new();
+
+            for import in option_imports.iter() {
+                let _ = writeln!(imports, "import \"{import}\";");
+            }
+
+            if !has_heading && imports_end < sb.len() {
+                imports.push('\n');
+            }
+
+            sb.insert_str(imports_end, &imports);
         }
     }
 
@@ -530,8 +586,11 @@ impl ProtobufDumper {
             );
         }
 
-        // Nested messages
+        // Nested messages — map entries are written as the map fields that use them
         for nested in &proto.nested_type {
+            if nested.options.as_ref().is_some_and(|o| o.map_entry()) {
+                continue;
+            }
             self.dump_descriptor(source, nested, sb, level + 1, &mut inner_marker);
         }
 
@@ -540,11 +599,12 @@ impl ProtobufDumper {
             self.dump_enum_descriptor(source, enum_type, sb, level + 1, &mut inner_marker);
         }
 
-        // Root fields (not part of a oneof)
+        // Root fields (not part of a oneof); proto3 optional fields are each in a
+        // oneof of their own that the compiler made, so keep them with the root fields
         let root_fields: Vec<&FieldDescriptorProto> = proto
             .field
             .iter()
-            .filter(|f| !f.has_oneof_index())
+            .filter(|f| !f.has_oneof_index() || f.proto3_optional())
             .collect();
 
         for field in &root_fields {
@@ -564,8 +624,17 @@ impl ProtobufDumper {
                 .filter(|f| f.has_oneof_index() && f.oneof_index() == i as i32)
                 .collect();
 
+            // Synthetic oneofs that wrap proto3 optional fields are not real oneofs
+            if oneof_fields.iter().any(|f| f.proto3_optional()) {
+                continue;
+            }
+
             append_heading_space(sb, &mut inner_marker);
             let _ = writeln!(sb, "{indent}\toneof {} {{", oneof.name());
+
+            for (key, value) in self.dump_oneof_options(source, oneof.options.as_ref()) {
+                let _ = writeln!(sb, "{indent}\t\toption {key} = {value};");
+            }
 
             for field in &oneof_fields {
                 let decl = self.build_descriptor_declaration(source, field, false);
@@ -576,17 +645,37 @@ impl ProtobufDumper {
             inner_marker = true;
         }
 
-        // Extension ranges
+        // Extension ranges — range ends in messages are exclusive
         for range in &proto.extension_range {
-            let max = if range.end() >= 536_870_911 {
-                "max".to_string()
+            let range_options = self.dump_ext_range_options(source, range.options.as_ref());
+            let parameters = if range_options.is_empty() {
+                String::new()
             } else {
-                range.end().to_string()
+                let opts: Vec<String> = range_options
+                    .iter()
+                    .map(|(k, v)| format!("{k} = {v}"))
+                    .collect();
+                format!(" [{}]", opts.join(", "))
             };
 
             append_heading_space(sb, &mut inner_marker);
-            let _ = writeln!(sb, "{indent}\textensions {} to {max};", range.start());
+            let _ = writeln!(
+                sb,
+                "{indent}\textensions {}{parameters};",
+                format_range(range.start(), range.end() - 1, MAX_FIELD_NUMBER)
+            );
         }
+
+        dump_reserved(
+            proto
+                .reserved_range
+                .iter()
+                .map(|r| format_range(r.start(), r.end() - 1, MAX_FIELD_NUMBER)),
+            &proto.reserved_name,
+            sb,
+            &indent,
+            &mut inner_marker,
+        );
 
         let _ = writeln!(sb, "{indent}}}");
         *marker = true;
@@ -627,6 +716,19 @@ impl ProtobufDumper {
                 enum_value.number()
             );
         }
+
+        // Reserved ranges — range ends in enums are inclusive
+        let mut inner_marker = false;
+        dump_reserved(
+            field
+                .reserved_range
+                .iter()
+                .map(|r| format_range(r.start(), r.end(), i32::MAX)),
+            &field.reserved_name,
+            sb,
+            &indent,
+            &mut inner_marker,
+        );
 
         let _ = writeln!(sb, "{indent}}}");
         *marker = true;
@@ -698,18 +800,24 @@ impl ProtobufDumper {
         field: &FieldDescriptorProto,
         emit_field_label: bool,
     ) -> String {
-        let type_name = resolve_type(field);
+        let mut type_name = resolve_type(field);
         let mut options: Vec<(String, String)> = Vec::new();
+        let is_proto2 = source.syntax().is_empty() || source.syntax() == "proto2";
 
-        // Default value
-        if !field.default_value().is_empty() {
-            let default = if field.type_() == Type::TYPE_STRING {
-                util::to_literal(field.default_value())
-            } else {
-                field.default_value().to_string()
+        // Default value — the presence check keeps empty string defaults
+        if field.has_default_value() {
+            // Strings are stored as is, bytes are already escaped
+            let default = match field.type_() {
+                Type::TYPE_STRING => util::to_literal(field.default_value()),
+                Type::TYPE_BYTES => format!("\"{}\"", field.default_value()),
+                _ => field.default_value().to_string(),
             };
             options.push(("default".to_string(), default));
-        } else if field.type_() == Type::TYPE_ENUM && field.label() != Label::LABEL_REPEATED {
+        } else if is_proto2
+            && field.type_() == Type::TYPE_ENUM
+            && field.label() != Label::LABEL_REPEATED
+        {
+            // Proto2 tracks the first enum value as the implicit default
             if let Some(type_node) = self.protobuf_type_map.get(field.type_name()) {
                 if let TypeSource::Enum(ref enum_desc) = type_node.source {
                     if let Some(first_val) = enum_desc.value.first() {
@@ -737,9 +845,36 @@ impl ProtobufDumper {
             format!(" [{}]", opts.join(", "))
         };
 
+        let mut label: Option<&'static str> = None;
+
+        let mut is_map = false;
+        if field.label() == Label::LABEL_REPEATED && field.type_() == Type::TYPE_MESSAGE {
+            if let Some(node) = self.protobuf_type_map.get(field.type_name()) {
+                if let TypeSource::Message(ref map_entry) = node.source {
+                    if map_entry.options.as_ref().is_some_and(|o| o.map_entry()) {
+                        let key = map_entry.field.iter().find(|f| f.number() == 1);
+                        let value = map_entry.field.iter().find(|f| f.number() == 2);
+                        if let (Some(key), Some(value)) = (key, value) {
+                            type_name =
+                                format!("map<{}, {}>", resolve_type(key), resolve_type(value));
+                            is_map = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Map fields carry no label
+        if !is_map && emit_field_label {
+            // Fields in proto3 have no label unless they are repeated or track presence
+            if is_proto2 || field.label() == Label::LABEL_REPEATED || field.proto3_optional() {
+                label = Some(get_label(field.label()));
+            }
+        }
+
         let mut decl = String::new();
-        if emit_field_label {
-            let _ = write!(decl, "{} ", get_label(field.label()));
+        if let Some(label) = label {
+            let _ = write!(decl, "{label} ");
         }
         let _ = write!(
             decl,
@@ -1000,8 +1135,47 @@ impl ProtobufDumper {
         if opts.has_deprecated() {
             kv.push(("deprecated".into(), bool_str(opts.deprecated())));
         }
+        if opts.has_idempotency_level() {
+            kv.push((
+                "idempotency_level".into(),
+                format!("{:?}", opts.idempotency_level()),
+            ));
+        }
 
         self.dump_options_extensions(source, ".google.protobuf.MethodOptions", opts, &mut kv);
+        kv
+    }
+
+    fn dump_oneof_options(
+        &self,
+        source: &FileDescriptorProto,
+        options: Option<&OneofOptions>,
+    ) -> Vec<(String, String)> {
+        let mut kv = Vec::new();
+        let Some(opts) = options else {
+            return kv;
+        };
+
+        self.dump_options_extensions(source, ".google.protobuf.OneofOptions", opts, &mut kv);
+        kv
+    }
+
+    fn dump_ext_range_options(
+        &self,
+        source: &FileDescriptorProto,
+        options: Option<&ExtensionRangeOptions>,
+    ) -> Vec<(String, String)> {
+        let mut kv = Vec::new();
+        let Some(opts) = options else {
+            return kv;
+        };
+
+        self.dump_options_extensions(
+            source,
+            ".google.protobuf.ExtensionRangeOptions",
+            opts,
+            &mut kv,
+        );
         kv
     }
 
@@ -1029,15 +1203,44 @@ impl ProtobufDumper {
             None => return,
         };
 
-        // Find all extension fields that extend this options type.
-        // Sort by field number for deterministic output order (HashMap iteration is random).
-        let mut sorted_types: Vec<_> = self.protobuf_type_map.iter().collect();
-        sorted_types.sort_by_key(|(_, node)| {
-            if let TypeSource::Field(ref field) = node.source {
-                field.number()
-            } else {
-                0
+        let values = raw_values_of(options);
+
+        // Options that the binary's descriptor.proto has but the descriptor message types do
+        // not, such as the ones Valve added, are left over as unknown fields. The fields the
+        // types do have were read into their properties and are dumped by the code above.
+        if let Some(type_node) = self.protobuf_type_map.get(type_name) {
+            if let TypeSource::Message(ref options_proto) = type_node.source {
+                let count = kv.len();
+
+                for field in &options_proto.field {
+                    if field.name() != "uninterpreted_option" {
+                        self.dump_options_field_recursive(field, &values, kv, field.name());
+                    }
+                }
+
+                if kv.len() > count {
+                    if let Some(proto_name) = &type_node.proto_name {
+                        if !dependencies.contains(proto_name) {
+                            self.option_imports.borrow_mut().insert(proto_name.clone());
+                        }
+                    }
+                }
             }
+        }
+
+        // Find all extension fields that extend this options type.
+        // Sort by field number (path as tiebreak) for deterministic output order
+        // (HashMap iteration is random).
+        let mut sorted_types: Vec<_> = self.protobuf_type_map.iter().collect();
+        sorted_types.sort_by(|(path_a, a), (path_b, b)| {
+            let number = |node: &ProtoTypeNode| {
+                if let TypeSource::Field(ref field) = node.source {
+                    field.number()
+                } else {
+                    0
+                }
+            };
+            number(a).cmp(&number(b)).then_with(|| path_a.cmp(path_b))
         });
         for (type_path, type_node) in sorted_types {
             let proto_name = match &type_node.proto_name {
@@ -1051,77 +1254,173 @@ impl ProtobufDumper {
 
             if let TypeSource::Field(ref field) = type_node.source {
                 if !field.extendee().is_empty() && field.extendee() == type_name {
-                    self.dump_options_field_recursive(field, options, kv, None, type_path);
+                    // The full name, extensions can be declared inside a message or a package
+                    let key = format!("({})", type_path.trim_start_matches('.'));
+                    self.dump_options_field_recursive(field, &values, kv, &key);
                 }
             }
         }
     }
 
-    fn dump_options_field_recursive<M: protobuf::Message>(
+    fn dump_options_field_recursive(
         &self,
         field: &FieldDescriptorProto,
-        message: &M,
+        values: &[(u32, RawValue)],
         kv: &mut Vec<(String, String)>,
-        path: Option<&str>,
-        _type_path: &str,
+        key: &str,
     ) {
-        let key = match path {
-            Some(p) => format!("{}.{}", p, field.name()),
-            None => format!("({})", field.name()),
-        };
-
-        let unknown_fields = message.special_fields().unknown_fields();
-
-        if is_named_type(field.type_()) && !field.type_name().is_empty() {
-            if let Some(type_node) = self.protobuf_type_map.get(field.type_name()) {
-                match &type_node.source {
-                    TypeSource::Enum(enum_proto) => {
-                        // Try to read as varint from unknown fields
-                        for val in unknown_fields.iter() {
-                            if val.0 == field.number() as u32 {
-                                if let UnknownValueRef::Varint(v) = val.1 {
-                                    if let Some(ev) =
-                                        enum_proto.value.iter().find(|e| e.number() == v as i32)
-                                    {
-                                        kv.push((key.clone(), ev.name().to_string()));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    TypeSource::Message(msg_proto) => {
-                        // Try to read as length-delimited from unknown fields
-                        for val in unknown_fields.iter() {
-                            if val.0 == field.number() as u32 {
-                                if let UnknownValueRef::LengthDelimited(bytes) = val.1 {
-                                    // Parse as a generic message to get its unknown fields
-                                    if let Ok(sub_msg) =
-                                        protobuf::descriptor::DescriptorProto::parse_from_bytes(
-                                            bytes,
-                                        )
-                                    {
-                                        for sub_field in &msg_proto.field {
-                                            self.dump_options_field_recursive(
-                                                sub_field,
-                                                &sub_msg,
-                                                kv,
-                                                Some(&key),
-                                                _type_path,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
+        // A message that is not repeated is written field by field, a repeated one is
+        // written as an aggregate value per element
+        if field.type_() == Type::TYPE_MESSAGE && field.label() != Label::LABEL_REPEATED {
+            let mut bytes: Option<&[u8]> = None;
+            for (num, val) in values {
+                if *num != field.number() as u32 {
+                    continue;
+                }
+                if let RawValue::LengthDelimited(b) = val {
+                    bytes = Some(b);
                 }
             }
-        } else {
-            // Scalar type — extract from unknown fields
-            if let Some(value) = extract_scalar_from_unknown(unknown_fields, field) {
-                kv.push((key, value));
+            let Some(bytes) = bytes else { return };
+
+            let Some(sub_values) = parse_wire_values(bytes) else {
+                return;
+            };
+
+            let count = kv.len();
+            if let Some(type_node) = self.protobuf_type_map.get(field.type_name()) {
+                if let TypeSource::Message(ref msg_proto) = type_node.source {
+                    for sub_field in &msg_proto.field {
+                        let sub_key = format!("{key}.{}", sub_field.name());
+                        self.dump_options_field_recursive(sub_field, &sub_values, kv, &sub_key);
+                    }
+                }
             }
+
+            if kv.len() == count {
+                kv.push((key.to_string(), "{}".to_string()));
+            }
+
+            return;
+        }
+
+        for value in self.get_option_values(values, field) {
+            kv.push((key.to_string(), value));
+        }
+    }
+
+    /// Returns the values of a field in an options message; a field that is not
+    /// repeated keeps its last value. Translation of the C# `GetOptionValues`.
+    fn get_option_values(
+        &self,
+        values: &[(u32, RawValue)],
+        field: &FieldDescriptorProto,
+    ) -> Vec<String> {
+        let field_num = field.number() as u32;
+        let mut out: Vec<String> = Vec::new();
+
+        for (num, val) in values {
+            if *num != field_num {
+                continue;
+            }
+
+            let value = match (field.type_(), val) {
+                (Type::TYPE_INT32, RawValue::Varint(v)) => Some((*v as u32 as i32).to_string()),
+                // Zigzag is not decoded for wire-level values
+                (Type::TYPE_SINT32, RawValue::Varint(v)) => {
+                    let x = *v as u32;
+                    Some(((x >> 1) as i32 ^ -((x & 1) as i32)).to_string())
+                }
+                (Type::TYPE_SFIXED32, RawValue::Fixed32(v)) => Some((*v as i32).to_string()),
+                (Type::TYPE_UINT32, RawValue::Varint(v)) => Some((*v as u32).to_string()),
+                (Type::TYPE_FIXED32, RawValue::Fixed32(v)) => Some(v.to_string()),
+                (Type::TYPE_INT64, RawValue::Varint(v)) => Some((*v as i64).to_string()),
+                (Type::TYPE_SINT64, RawValue::Varint(v)) => {
+                    let x = *v;
+                    Some(((x >> 1) as i64 ^ -((x & 1) as i64)).to_string())
+                }
+                (Type::TYPE_SFIXED64, RawValue::Fixed64(v)) => Some((*v as i64).to_string()),
+                (Type::TYPE_UINT64, RawValue::Varint(v)) => Some(v.to_string()),
+                (Type::TYPE_FIXED64, RawValue::Fixed64(v)) => Some(v.to_string()),
+                (Type::TYPE_BOOL, RawValue::Varint(v)) => {
+                    Some(if *v != 0 { "true" } else { "false" }.to_string())
+                }
+                (Type::TYPE_FLOAT, RawValue::Fixed32(v)) => {
+                    Some(util::to_literal_f32(f32::from_bits(*v)))
+                }
+                (Type::TYPE_DOUBLE, RawValue::Fixed64(v)) => {
+                    Some(util::to_literal_f64(f64::from_bits(*v)))
+                }
+                (Type::TYPE_STRING, RawValue::LengthDelimited(bytes)) => {
+                    std::str::from_utf8(bytes).ok().map(util::to_literal)
+                }
+                (Type::TYPE_BYTES, RawValue::LengthDelimited(bytes)) => {
+                    Some(util::to_literal_bytes(bytes))
+                }
+                (Type::TYPE_ENUM, RawValue::Varint(v)) => {
+                    Some(self.get_enum_value_name(field, *v as u32 as i32))
+                }
+                (Type::TYPE_MESSAGE, RawValue::LengthDelimited(bytes)) => {
+                    let Some(type_node) = self.protobuf_type_map.get(field.type_name()) else {
+                        continue;
+                    };
+                    let TypeSource::Message(ref msg_proto) = type_node.source else {
+                        continue;
+                    };
+                    let Some(sub_values) = parse_wire_values(bytes) else {
+                        continue;
+                    };
+                    Some(self.build_aggregate_value(msg_proto, &sub_values))
+                }
+                _ => None,
+            };
+
+            if let Some(value) = value {
+                out.push(value);
+            }
+        }
+
+        if field.label() != Label::LABEL_REPEATED && out.len() > 1 {
+            out.drain(..out.len() - 1);
+        }
+
+        out
+    }
+
+    fn get_enum_value_name(&self, field: &FieldDescriptorProto, number: i32) -> String {
+        if let Some(type_node) = self.protobuf_type_map.get(field.type_name()) {
+            if let TypeSource::Enum(ref enum_proto) = type_node.source {
+                if let Some(value) = enum_proto.value.iter().find(|e| e.number() == number) {
+                    return value.name().to_string();
+                }
+            }
+        }
+
+        // Unknown values can only be written as their number
+        number.to_string()
+    }
+
+    fn build_aggregate_value(
+        &self,
+        message_proto: &DescriptorProto,
+        values: &[(u32, RawValue)],
+    ) -> String {
+        let mut fields: Vec<String> = Vec::new();
+
+        for sub_field in &message_proto.field {
+            for value in self.get_option_values(values, sub_field) {
+                if sub_field.type_() == Type::TYPE_MESSAGE {
+                    fields.push(format!("{} {value}", sub_field.name()));
+                } else {
+                    fields.push(format!("{}: {value}", sub_field.name()));
+                }
+            }
+        }
+
+        if fields.is_empty() {
+            "{}".to_string()
+        } else {
+            format!("{{ {} }}", fields.join(" "))
         }
     }
 }
@@ -1194,80 +1493,156 @@ fn append_heading_space(sb: &mut String, marker: &mut bool) {
     }
 }
 
-/// Extracts a scalar value from the unknown fields of a message, matching by field number.
-fn extract_scalar_from_unknown(
-    unknown_fields: &protobuf::UnknownFields,
-    field: &FieldDescriptorProto,
-) -> Option<String> {
-    let field_num = field.number() as u32;
+/// A value read straight from the wire, used to dump option values in the
+/// format they were written in (the protobuf crate does not wire-format-verify
+/// unknown fields).
+enum RawValue {
+    Varint(u64),
+    Fixed32(u32),
+    Fixed64(u64),
+    LengthDelimited(Vec<u8>),
+}
 
-    for (num, val) in unknown_fields.iter() {
-        if num != field_num {
-            continue;
+/// Copies the unknown fields of a parsed message into a unified wire-value list.
+fn raw_values_of<M: protobuf::Message>(message: &M) -> Vec<(u32, RawValue)> {
+    message
+        .special_fields()
+        .unknown_fields()
+        .iter()
+        .map(|(num, val)| {
+            let value = match val {
+                UnknownValueRef::Varint(v) => RawValue::Varint(v),
+                UnknownValueRef::Fixed32(v) => RawValue::Fixed32(v),
+                UnknownValueRef::Fixed64(v) => RawValue::Fixed64(v),
+                UnknownValueRef::LengthDelimited(bytes) => {
+                    RawValue::LengthDelimited(bytes.to_vec())
+                }
+            };
+            (num, value)
+        })
+        .collect()
+}
+
+/// Parses raw wire-format data into field-numbered wire values, without any
+/// schema. Returns `None` if the data is malformed.
+fn parse_wire_values(data: &[u8]) -> Option<Vec<(u32, RawValue)>> {
+    let mut values = Vec::new();
+    let mut pos = 0;
+
+    while pos < data.len() {
+        let (tag, new_pos) = read_varint(data, pos)?;
+        if tag == 0 {
+            return None;
         }
-        match field.type_() {
-            Type::TYPE_INT32 | Type::TYPE_UINT32 | Type::TYPE_FIXED32 => {
-                if let UnknownValueRef::Varint(v) = val {
-                    return Some((v as u32).to_string());
-                }
-                if let UnknownValueRef::Fixed32(v) = val {
-                    return Some(v.to_string());
-                }
+        pos = new_pos;
+
+        let field_number = (tag >> 3) as u32;
+        match tag & 0x07 {
+            // Varint
+            0 => {
+                let (value, new_pos) = read_varint(data, pos)?;
+                pos = new_pos;
+                values.push((field_number, RawValue::Varint(value)));
             }
-            Type::TYPE_INT64 | Type::TYPE_UINT64 | Type::TYPE_FIXED64 => {
-                if let UnknownValueRef::Varint(v) = val {
-                    return Some(v.to_string());
-                }
-                if let UnknownValueRef::Fixed64(v) = val {
-                    return Some(v.to_string());
-                }
+            // 64-bit
+            1 => {
+                let bytes = data.get(pos..pos + 8)?;
+                pos += 8;
+                values.push((
+                    field_number,
+                    RawValue::Fixed64(u64::from_le_bytes(bytes.try_into().ok()?)),
+                ));
             }
-            Type::TYPE_SINT32 | Type::TYPE_SFIXED32 => {
-                if let UnknownValueRef::Varint(v) = val {
-                    return Some((v as i32).to_string());
-                }
-                if let UnknownValueRef::Fixed32(v) = val {
-                    return Some((v as i32).to_string());
-                }
+            // Length-delimited
+            2 => {
+                let (length, new_pos) = read_varint(data, pos)?;
+                let end = new_pos.checked_add(length as usize)?;
+                let bytes = data.get(new_pos..end)?;
+                pos = end;
+                values.push((field_number, RawValue::LengthDelimited(bytes.to_vec())));
             }
-            Type::TYPE_SINT64 | Type::TYPE_SFIXED64 => {
-                if let UnknownValueRef::Varint(v) = val {
-                    return Some((v as i64).to_string());
-                }
-                if let UnknownValueRef::Fixed64(v) = val {
-                    return Some((v as i64).to_string());
-                }
+            // Group: values within it are not collected, only skipped over
+            3 => {
+                pos = skip_group(data, pos)?;
             }
-            Type::TYPE_STRING => {
-                if let UnknownValueRef::LengthDelimited(bytes) = val {
-                    if let Ok(s) = std::str::from_utf8(bytes) {
-                        return Some(util::to_literal(s));
-                    }
-                }
+            // 32-bit
+            5 => {
+                let bytes = data.get(pos..pos + 4)?;
+                pos += 4;
+                values.push((
+                    field_number,
+                    RawValue::Fixed32(u32::from_le_bytes(bytes.try_into().ok()?)),
+                ));
             }
-            Type::TYPE_BOOL => {
-                if let UnknownValueRef::Varint(v) = val {
-                    return Some(if v != 0 { "true" } else { "false" }.to_string());
-                }
-            }
-            Type::TYPE_BYTES => {
-                if let UnknownValueRef::LengthDelimited(bytes) = val {
-                    return Some(format!("{:?}", bytes));
-                }
-            }
-            Type::TYPE_DOUBLE => {
-                if let UnknownValueRef::Fixed64(v) = val {
-                    return Some(f64::from_bits(v).to_string());
-                }
-            }
-            Type::TYPE_FLOAT => {
-                if let UnknownValueRef::Fixed32(v) = val {
-                    return Some(f32::from_bits(v).to_string());
-                }
-            }
-            _ => {}
+            _ => return None,
         }
     }
 
-    None
+    Some(values)
+}
+
+/// Skips over a group (wire types 3/4) in raw wire-format data.
+fn skip_group(data: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let (tag, new_pos) = read_varint(data, pos)?;
+        if tag == 0 {
+            return None;
+        }
+        pos = new_pos;
+
+        match tag & 0x07 {
+            0 => {
+                let (_, new_pos) = read_varint(data, pos)?;
+                pos = new_pos;
+            }
+            1 => pos = pos.checked_add(8).filter(|&p| p <= data.len())?,
+            2 => {
+                let (length, new_pos) = read_varint(data, pos)?;
+                pos = new_pos.checked_add(length as usize)?;
+                if pos > data.len() {
+                    return None;
+                }
+            }
+            3 => pos = skip_group(data, pos)?,
+            // End group
+            4 => return Some(pos),
+            5 => pos = pos.checked_add(4).filter(|&p| p <= data.len())?,
+            _ => return None,
+        }
+    }
+}
+
+const MAX_FIELD_NUMBER: i32 = 536_870_911;
+
+fn format_range(start: i32, end: i32, max: i32) -> String {
+    if start == end {
+        return format!("{start}");
+    }
+
+    if end >= max {
+        format!("{start} to max")
+    } else {
+        format!("{start} to {end}")
+    }
+}
+
+fn dump_reserved(
+    ranges: impl Iterator<Item = String>,
+    names: &[String],
+    sb: &mut String,
+    indent: &str,
+    marker: &mut bool,
+) {
+    let range_list: Vec<String> = ranges.collect();
+
+    if !range_list.is_empty() {
+        append_heading_space(sb, marker);
+        let _ = writeln!(sb, "{indent}\treserved {};", range_list.join(", "));
+    }
+
+    if !names.is_empty() {
+        append_heading_space(sb, marker);
+        let literals: Vec<String> = names.iter().map(|n| util::to_literal(n)).collect();
+        let _ = writeln!(sb, "{indent}\treserved {};", literals.join(", "));
+    }
 }

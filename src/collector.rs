@@ -104,7 +104,7 @@ fn consume_one_message(data: &[u8]) -> Option<usize> {
 
 /// Reads a varint from the data at the given position.
 /// Returns `(value, new_position)` or `None` if the data is truncated.
-fn read_varint(data: &[u8], mut pos: usize) -> Option<(u64, usize)> {
+pub(crate) fn read_varint(data: &[u8], mut pos: usize) -> Option<(u64, usize)> {
     let mut result: u64 = 0;
     let mut shift = 0;
 
