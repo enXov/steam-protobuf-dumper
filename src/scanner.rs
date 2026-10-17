@@ -2,9 +2,9 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 /// Compiled regex for validating proto file names.
-/// Matches: alphanumeric, underscores, forward/backslashes, dots — ending in `.proto`.
+/// Matches: alphanumeric, underscores, dashes, forward/backslashes, dots — ending in `.proto`.
 static PROTO_FILENAME_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[a-zA-Z_0-9\\/.]+\.proto$").expect("valid regex"));
+    Lazy::new(|| Regex::new(r"^[a-zA-Z_0-9\\/.-]+\.proto$").expect("valid regex"));
 
 /// Scans raw binary data for embedded protobuf `FileDescriptorProto` blobs.
 ///
@@ -75,5 +75,31 @@ where
                 i += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regex_accepts_normal_names() {
+        assert!(PROTO_FILENAME_REGEX.is_match("steam/steammessages_base.proto"));
+        assert!(PROTO_FILENAME_REGEX.is_match("csgo\\cstrike15_usermessages.proto"));
+        assert!(PROTO_FILENAME_REGEX.is_match("a.proto"));
+    }
+
+    #[test]
+    fn regex_accepts_dashes_in_names() {
+        assert!(PROTO_FILENAME_REGEX.is_match("steam/steam-ui-messages.proto"));
+        assert!(PROTO_FILENAME_REGEX.is_match("some-name.proto"));
+    }
+
+    #[test]
+    fn regex_rejects_invalid_names() {
+        assert!(!PROTO_FILENAME_REGEX.is_match("with space.proto"));
+        assert!(!PROTO_FILENAME_REGEX.is_match(".proto"));
+        assert!(!PROTO_FILENAME_REGEX.is_match("trailing.proto.x"));
+        assert!(!PROTO_FILENAME_REGEX.is_match("éè.proto"));
     }
 }
